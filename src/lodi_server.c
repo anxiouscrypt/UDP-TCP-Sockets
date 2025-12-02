@@ -1,23 +1,40 @@
-/* Lodi Server: verifies login via PKE, triggers TFA via TFA server, and replies with ackLogin. */
+/* Lodi Server (Project 2, COSC 439): TCP per-request; login via PKE/TFA; handles follow/unfollow/post/feed/logout. */
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
-#include <errno.h>
 
 #include "protocol.h"
 #include "util.h"
+
+#define MAX_POSTS 512
+#define MAX_FOLLOWS 512
+
+typedef struct {
+    unsigned int idolID;
+    char text[100];
+} Post;
+
+typedef struct {
+    unsigned int fanID;
+    unsigned int idolID;
+} FollowEntry;
+
+static Post posts[MAX_POSTS];
+static int post_count = 0;
+static FollowEntry follows[MAX_FOLLOWS];
+static int follow_count = 0;
 
 static void DieWithError(const char *msg) {
     perror(msg);
     exit(1);
 }
 
-/* Ask PKE server for a user's public key. */
+/* UDP: request public key from PKE server. */
 static unsigned int request_public_key(int sock, const struct sockaddr_in *pkeAddr, unsigned int userID) {
     PClientToPKServer req;
     memset(&req, 0, sizeof(req));
@@ -28,35 +45,20 @@ static unsigned int request_public_key(int sock, const struct sockaddr_in *pkeAd
     if (sendto(sock, &req, sizeof(req), 0, (const struct sockaddr *)pkeAddr, sizeof(*pkeAddr)) != sizeof(req)) {
         DieWithError("sendto requestKey failed");
     }
-    printf("[Lodi Server] Sent requestKey to PKE Server for user %u\n", userID);
-
     PKServerToPClientOrLodiServer resp;
     struct sockaddr_in from;
     socklen_t fromLen = sizeof(from);
-    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ssize_t r = recvfrom(sock, &resp, sizeof(resp), 0, (struct sockaddr *)&from, &fromLen);
-    /* Disable timeout for other operations. */
-    struct timeval tv0 = { .tv_sec = 0, .tv_usec = 0 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof(tv0));
-    if (r == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        fprintf(stderr, "Timeout waiting for PKE response for user %u\n", userID);
-        return 0;
-    }
     if (r != sizeof(resp)) {
-        fprintf(stderr, "Unexpected PKE response size: %zd\n", r);
         return 0;
     }
     if (resp.messageType != responsePublicKey || resp.userID != userID) {
-        fprintf(stderr, "Invalid PKE response\n");
         return 0;
     }
-    printf("[Lodi Server] Received responsePublicKey from PKE Server for user %u (publicKey=%u)\n",
-           resp.userID, resp.publicKey);
     return resp.publicKey;
 }
 
-/* Ask TFA server to authenticate a user; returns 1 on success, 0 on failure. */
+/* UDP: request second factor via TFA server. */
 static int request_tfa(int sock, const struct sockaddr_in *tfaAddr, unsigned int userID) {
     TFAClientOrLodiServerToTFAServer req;
     memset(&req, 0, sizeof(req));
@@ -68,37 +70,130 @@ static int request_tfa(int sock, const struct sockaddr_in *tfaAddr, unsigned int
     if (sendto(sock, &req, sizeof(req), 0, (const struct sockaddr *)tfaAddr, sizeof(*tfaAddr)) != sizeof(req)) {
         DieWithError("sendto requestAuth failed");
     }
-    printf("[Lodi Server] Sent requestAuth to TFA Server for user %u\n", userID);
-
     TFAServerToLodiServer resp;
     struct sockaddr_in from;
     socklen_t fromLen = sizeof(from);
-    struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     ssize_t r = recvfrom(sock, &resp, sizeof(resp), 0, (struct sockaddr *)&from, &fromLen);
-    struct timeval tv0 = { .tv_sec = 0, .tv_usec = 0 };
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv0, sizeof(tv0));
-    if (r == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-        fprintf(stderr, "Timeout waiting for responseAuth for user %u\n", userID);
-        return 0;
-    }
     if (r != sizeof(resp)) {
-        fprintf(stderr, "Unexpected responseAuth size: %zd\n", r);
         return 0;
     }
-    printf("[Lodi Server] Received responseAuth from TFA Server (userID=%u)\n", resp.userID);
-    /* Success if userID echoed; failure if 0 or mismatch. */
     return (resp.userID == userID);
+}
+
+static void add_follow(unsigned int fan, unsigned int idol) {
+    if (follow_count >= MAX_FOLLOWS) return;
+    follows[follow_count].fanID = fan;
+    follows[follow_count].idolID = idol;
+    follow_count++;
+}
+
+static void remove_follow(unsigned int fan, unsigned int idol) {
+    for (int i = 0; i < follow_count; ++i) {
+        if (follows[i].fanID == fan && follows[i].idolID == idol) {
+            follows[i] = follows[follow_count - 1];
+            follow_count--;
+            return;
+        }
+    }
+}
+
+static int is_follower(unsigned int fan, unsigned int idol) {
+    for (int i = 0; i < follow_count; ++i) {
+        if (follows[i].fanID == fan && follows[i].idolID == idol) return 1;
+    }
+    return 0;
+}
+
+static void add_post(unsigned int idol, const char *text) {
+    if (post_count >= MAX_POSTS) return;
+    posts[post_count].idolID = idol;
+    strncpy(posts[post_count].text, text, sizeof(posts[post_count].text) - 1);
+    posts[post_count].text[sizeof(posts[post_count].text) - 1] = '\0';
+    post_count++;
+}
+
+static void build_feed(unsigned int fan, char *out, size_t outlen) {
+    out[0] = '\0';
+    for (int i = 0; i < post_count; ++i) {
+        if (is_follower(fan, posts[i].idolID)) {
+            char line[128];
+            snprintf(line, sizeof(line), "[%u] %s\n", posts[i].idolID, posts[i].text);
+            if (strlen(out) + strlen(line) + 1 < outlen) {
+                strcat(out, line);
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+static void handle_client(int clntSock, int udpSock, const struct sockaddr_in *pkeAddr, const struct sockaddr_in *tfaAddr) {
+    PClientToLodiServer req;
+    ssize_t n = recv(clntSock, &req, sizeof(req), 0);
+    if (n != sizeof(req)) {
+        fprintf(stderr, "[Lodi Server] Invalid request size\n");
+        return;
+    }
+
+    LodiServerMessage resp;
+    memset(&resp, 0, sizeof(resp));
+
+    switch (req.messageType) {
+        case login: {
+            unsigned int pub = request_public_key(udpSock, pkeAddr, req.userID);
+            int authOK = 0;
+            if (pub && rsa_verify(req.digitalSig, req.timestamp, RSA_PUBLIC_EXP, pub)) {
+                authOK = request_tfa(udpSock, tfaAddr, req.userID);
+            }
+            resp.messageType = ackLogin;
+            resp.userID = authOK ? req.userID : 0;
+            break;
+        }
+        case follow: {
+            add_follow(req.userID, req.recipientID);
+            resp.messageType = ackFollow;
+            resp.userID = req.userID;
+            break;
+        }
+        case unfollow: {
+            remove_follow(req.userID, req.recipientID);
+            resp.messageType = ackUnfollow;
+            resp.userID = req.userID;
+            break;
+        }
+        case post: {
+            add_post(req.userID, req.message);
+            resp.messageType = ackPost;
+            resp.userID = req.userID;
+            strncpy(resp.message, "OK", sizeof(resp.message) - 1);
+            break;
+        }
+        case feed: {
+            resp.messageType = ackFeed;
+            resp.userID = req.userID;
+            build_feed(req.userID, resp.message, sizeof(resp.message));
+            break;
+        }
+        case logout: {
+            resp.messageType = ackLogout;
+            resp.userID = req.userID;
+            break;
+        }
+        default:
+            fprintf(stderr, "[Lodi Server] Unknown messageType=%d\n", req.messageType);
+            return;
+    }
+
+    send(clntSock, &resp, sizeof(resp), 0);
 }
 
 int main(int argc, char *argv[]) {
     if (argc != 5) {
-        fprintf(stderr, "Usage: %s <LODI_SERVER_PORT> <PKE_IP> <PKE_PORT> <TFA_IP:TFA_PORT>\n", argv[0]);
-        fprintf(stderr, "Example: %s 5002 127.0.0.1 5000 127.0.0.1:5001\n", argv[0]);
+        fprintf(stderr, "Usage: %s <LODI_TCP_PORT> <PKE_IP> <PKE_PORT> <TFA_IP:TFA_PORT>\n", argv[0]);
         exit(1);
     }
 
-    unsigned short myPort = (unsigned short)atoi(argv[1]);
+    unsigned short tcpPort = (unsigned short)atoi(argv[1]);
     char *pkeIP = argv[2];
     unsigned short pkePort = (unsigned short)atoi(argv[3]);
     char *tfaSpec = argv[4];
@@ -112,18 +207,8 @@ int main(int argc, char *argv[]) {
     char *tfaIP = tfaSpec;
     unsigned short tfaPort = (unsigned short)atoi(colon + 1);
 
-    int sock = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) DieWithError("socket() failed");
-
-    struct sockaddr_in servAddr;
-    memset(&servAddr, 0, sizeof(servAddr));
-    servAddr.sin_family = AF_INET;
-    servAddr.sin_addr.s_addr = htonl(INADDR_ANY);
-    servAddr.sin_port = htons(myPort);
-
-    if (bind(sock, (struct sockaddr *)&servAddr, sizeof(servAddr)) < 0) {
-        DieWithError("bind() failed");
-    }
+    int udpSock = socket(PF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (udpSock < 0) DieWithError("udp socket() failed");
 
     struct sockaddr_in pkeAddr;
     memset(&pkeAddr, 0, sizeof(pkeAddr));
@@ -137,61 +222,35 @@ int main(int argc, char *argv[]) {
     tfaAddr.sin_addr.s_addr = inet_addr(tfaIP);
     tfaAddr.sin_port = htons(tfaPort);
 
-    printf("[Lodi Server] Listening on UDP port %u; PKE %s:%u; TFA %s:%u\n", myPort, pkeIP, pkePort,
-           tfaIP, tfaPort);
+    int listenSock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listenSock < 0) DieWithError("tcp socket() failed");
+    int opt = 1;
+    setsockopt(listenSock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    for (;;) {  /* main loop */
-        struct sockaddr_in from;
-        socklen_t fromLen = sizeof(from);
-        PClientToLodiServer msg;
-        ssize_t n = recvfrom(sock, &msg, sizeof(msg), 0, (struct sockaddr *)&from, &fromLen);
-        if (n < 0) DieWithError("recvfrom() failed");
-        if ((size_t)n < sizeof(msg)) {
-            fprintf(stderr, "[Lodi Server] Ignoring undersized packet (%zd bytes)\n", n);
+    struct sockaddr_in servAddr;
+    memset(&servAddr, 0, sizeof(servAddr));
+    servAddr.sin_family = AF_INET;
+    servAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    servAddr.sin_port = htons(tcpPort);
+
+    if (bind(listenSock, (struct sockaddr *)&servAddr, sizeof(servAddr)) < 0) DieWithError("bind() failed");
+    if (listen(listenSock, 5) < 0) DieWithError("listen() failed");
+
+    printf("[Lodi Server] Listening on TCP port %u; PKE %s:%u; TFA %s:%u\n", tcpPort, pkeIP, pkePort, tfaIP, tfaPort);
+
+    for (;;) {
+        struct sockaddr_in clntAddr;
+        socklen_t clntLen = sizeof(clntAddr);
+        int clntSock = accept(listenSock, (struct sockaddr *)&clntAddr, &clntLen);
+        if (clntSock < 0) {
+            perror("accept() failed");
             continue;
         }
-
-        char addrbuf[64];
-        fmt_addr(&from, addrbuf, sizeof(addrbuf));
-        printf("[Lodi Server] Received login from %s for user %u\n", addrbuf, msg.userID);
-
-        /* First factor: verify signature using PKE. */
-        unsigned int pub = request_public_key(sock, &pkeAddr, msg.userID);
-        int authOK = 0;
-        if (pub != 0) {
-            if (rsa_verify(msg.digitalSig, msg.timestamp, RSA_PUBLIC_EXP, pub)) {
-                authOK = 1;
-                printf("[Lodi Server] First factor passed for user %u (signature verified)\n", msg.userID);
-            } else {
-                printf("[Lodi Server] First factor failed: signature mismatch for user %u\n", msg.userID);
-            }
-        } else {
-            printf("[Lodi Server] No public key for user %u\n", msg.userID);
-        }
-
-        /* Second factor via TFA server. */
-        int tfaOK = 0;
-        if (authOK) {
-            tfaOK = request_tfa(sock, &tfaAddr, msg.userID);
-            printf("[Lodi Server] Second factor %s for user %u\n", tfaOK ? "passed" : "failed",
-                   msg.userID);
-        }
-
-        LodiServerToLodiClientAcks ack;
-        ack.messageType = ackLogin;
-        /* userID echoed on success; 0 on failure to signal auth failure to client. */
-        ack.userID = (authOK && tfaOK) ? msg.userID : 0;
-        ssize_t s = sendto(sock, &ack, sizeof(ack), 0, (struct sockaddr *)&from, fromLen);
-        if (s != sizeof(ack)) DieWithError("sendto ackLogin failed");
-
-        if (!(authOK && tfaOK)) {
-            /* Additional console error to satisfy "display corresponding error messages" requirement. */
-            fprintf(stderr, "[Lodi Server] Login failed for user %u (first=%d, second=%d)\n", msg.userID, authOK, tfaOK);
-        } else {
-            printf("[Lodi Server] Login succeeded for user %u; sent ackLogin\n", msg.userID);
-        }
+        handle_client(clntSock, udpSock, &pkeAddr, &tfaAddr);
+        close(clntSock);
     }
 
-    close(sock);
+    close(listenSock);
+    close(udpSock);
     return 0;
 }
