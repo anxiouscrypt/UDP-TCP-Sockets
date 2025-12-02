@@ -205,20 +205,20 @@ int main(int argc, char *argv[]) {
                 }
                 printf("[Lodi Client] Sent login (attempt %d) to Lodi Server for user %u\n", attempts, userID);
 
-                LodiServerToLodiClientAcks ack;
-                struct sockaddr_in from;
-                socklen_t fromLen = sizeof(from);
-                ssize_t r = recvfrom(sock, &ack, sizeof(ack), 0, (struct sockaddr *)&from, &fromLen);
-                if (r == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    printf("[Lodi Client] Timeout waiting for ackLogin (attempt %d)\n", attempts);
-                    continue;
-                }
-                if (r != sizeof(ack) || ack.messageType != ackLogin) {
-                    fprintf(stderr, "[Lodi Client] Failed to receive valid ackLogin\n");
-                    break;
-                }
-                if (ack.userID == userID) {
-                    logged_in = 1;
+            LodiServerMessage ack;
+            struct sockaddr_in from;
+            socklen_t fromLen = sizeof(from);
+            ssize_t r = recvfrom(sock, &ack, sizeof(ack), 0, (struct sockaddr *)&from, &fromLen);
+            if (r == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                printf("[Lodi Client] Timeout waiting for ackLogin (attempt %d)\n", attempts);
+                continue;
+            }
+            if (r != sizeof(ack) || ack.messageType != ackLogin) {
+                fprintf(stderr, "[Lodi Client] Failed to receive valid ackLogin\n");
+                break;
+            }
+            if (ack.userID == userID) {
+                logged_in = 1;
                     login_ok = 1;
                     printf("[Lodi Client] Login succeeded for user %u (now logged in)\n", userID);
                 } else {
