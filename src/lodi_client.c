@@ -75,6 +75,28 @@ static void prompt_username(char *out, size_t len, unsigned int *userID) {
     *userID = (unsigned int)(h & 0xFFFFFFFFu);
 }
 
+/* Derive userID from an arbitrary username string (same hash as prompt_username). */
+static unsigned int user_id_from_name(const char *name) {
+    unsigned long h = 5381;
+    for (const char *p = name; *p; ++p) {
+        h = ((h << 5) + h) + (unsigned long)(unsigned char)(*p);
+    }
+    return (unsigned int)(h & 0xFFFFFFFFu);
+}
+
+/* Prompt for an idol's username and return its hashed userID. */
+static unsigned int prompt_idol_user(char *nameBuf, size_t nameLen) {
+    printf("[Lodi Client] Enter idol username: ");
+    fflush(stdout);
+    if (!fgets(nameBuf, nameLen, stdin)) {
+        fprintf(stderr, "[Lodi Client] Input error\n");
+        return 0;
+    }
+    size_t l = strlen(nameBuf);
+    if (l && nameBuf[l - 1] == '\n') nameBuf[l - 1] = '\0';
+    return user_id_from_name(nameBuf);
+}
+
 static int send_tcp_request(const char *serverIP, unsigned short serverPort,
                             const PClientToLodiServer *req, LodiServerMessage *resp) {
     int sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -104,6 +126,64 @@ static int send_tcp_request(const char *serverIP, unsigned short serverPort,
         return 0;
     }
     return 1;
+}
+
+/* Specialized feed request: reads all ackFeed messages until server closes the connection. */
+static int request_feed(const char *serverIP, unsigned short serverPort, const PClientToLodiServer *req) {
+    int sock = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock < 0) {
+        perror("[Lodi Client] socket TCP failed");
+        return 0;
+    }
+    struct sockaddr_in servAddr;
+    memset(&servAddr, 0, sizeof(servAddr));
+    servAddr.sin_family = AF_INET;
+    servAddr.sin_addr.s_addr = inet_addr(serverIP);
+    servAddr.sin_port = htons(serverPort);
+    if (connect(sock, (struct sockaddr *)&servAddr, sizeof(servAddr)) < 0) {
+        perror("[Lodi Client] connect failed");
+        close(sock);
+        return 0;
+    }
+    if (send(sock, req, sizeof(*req), 0) != sizeof(*req)) {
+        perror("[Lodi Client] send request failed");
+        close(sock);
+        return 0;
+    }
+    int got = 0;
+    for (;;) {
+        LodiServerMessage resp;
+        ssize_t r = recv(sock, &resp, sizeof(resp), 0);
+        if (r == 0) break;          /* server closed connection */
+        if (r < 0) {                /* error */
+            perror("[Lodi Client] recv feed failed");
+            break;
+        }
+        if (r != sizeof(resp)) {
+            fprintf(stderr, "[Lodi Client] Ignoring partial feed message (%zd bytes)\n", r);
+            continue;
+        }
+        if (resp.messageType == ackFeed && resp.userID == req->userID) {
+            unsigned int idolID = 0;
+            const char *body = resp.message;
+            if (resp.message[0] == '[') {
+                sscanf(resp.message, "[%u]", &idolID);
+                char *closing = strchr(resp.message, ']');
+                if (closing) {
+                    body = closing + 1;
+                    if (*body == ' ') body++;
+                }
+            }
+            if (idolID != 0) {
+                printf("[Lodi Client] Idol Post from user%u: %s\n", idolID, body);
+            } else {
+                printf("[Lodi Client] Idol Post: %s\n", body);
+            }
+            got = 1;
+        }
+    }
+    close(sock);
+    return got;
 }
 
 int main(int argc, char *argv[]) {
@@ -142,8 +222,8 @@ int main(int argc, char *argv[]) {
     for (;;) {
         printf("\n[Lodi Client] Menu:\n");
         if (!logged_in) {
-            printf(" 1) Register Key with PKE Server (UDP)\n");
-            printf(" 2) Login to Lodi Server (TCP)\n");
+            printf(" 1) Register for Lodi\n");
+            printf(" 2) Login to Lodi\n");
             printf(" 3) Exit\n");
         } else {
             printf(" 1) Follow idol\n");
@@ -246,7 +326,8 @@ int main(int argc, char *argv[]) {
             }
         } else {
             if (choice == 1) { /* follow */
-                unsigned int idol = prompt_uint("[Lodi Client] Enter idol userID to follow: ");
+                char idolName[128];
+                unsigned int idol = prompt_idol_user(idolName, sizeof(idolName));
                 PClientToLodiServer req;
                 memset(&req, 0, sizeof(req));
                 req.messageType = follow;
@@ -254,12 +335,13 @@ int main(int argc, char *argv[]) {
                 req.recipientID = idol;
                 LodiServerMessage resp;
                 if (send_tcp_request(lodiIP, lodiPort, &req, &resp) && resp.messageType == ackFollow && resp.userID == userID) {
-                    printf("[Lodi Client] Followed idol %u\n", idol);
+                    printf("[Lodi Client] Followed idol \"%s\" (user%u)\n", idolName, idol);
                 } else {
-                    printf("[Lodi Client] Failed to follow idol %u\n", idol);
+                    printf("[Lodi Client] Failed to follow idol \"%s\" (user%u)\n", idolName, idol);
                 }
             } else if (choice == 2) { /* unfollow */
-                unsigned int idol = prompt_uint("[Lodi Client] Enter idol userID to unfollow: ");
+                char idolName[128];
+                unsigned int idol = prompt_idol_user(idolName, sizeof(idolName));
                 PClientToLodiServer req;
                 memset(&req, 0, sizeof(req));
                 req.messageType = unfollow;
@@ -267,9 +349,9 @@ int main(int argc, char *argv[]) {
                 req.recipientID = idol;
                 LodiServerMessage resp;
                 if (send_tcp_request(lodiIP, lodiPort, &req, &resp) && resp.messageType == ackUnfollow && resp.userID == userID) {
-                    printf("[Lodi Client] Unfollowed idol %u\n", idol);
+                    printf("[Lodi Client] Unfollowed idol \"%s\" (user%u)\n", idolName, idol);
                 } else {
-                    printf("[Lodi Client] Failed to unfollow idol %u\n", idol);
+                    printf("[Lodi Client] Failed to unfollow idol \"%s\" (user%u)\n", idolName, idol);
                 }
             } else if (choice == 3) { /* post */
                 char text[100];
@@ -297,12 +379,8 @@ int main(int argc, char *argv[]) {
                 memset(&req, 0, sizeof(req));
                 req.messageType = feed;
                 req.userID = userID;
-                LodiServerMessage resp;
-                if (send_tcp_request(lodiIP, lodiPort, &req, &resp) && resp.messageType == ackFeed && resp.userID == userID) {
-                    printf("[Lodi Client] Feed:\n%s\n", resp.message);
-                } else {
-                    printf("[Lodi Client] Feed request failed\n");
-                }
+                int ok = request_feed(lodiIP, lodiPort, &req);
+                if (!ok) printf("[Lodi Client] Feed request failed or no items.\n");
             } else if (choice == 5) { /* logout */
                 PClientToLodiServer req;
                 memset(&req, 0, sizeof(req));

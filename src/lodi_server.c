@@ -13,6 +13,7 @@
 
 #define MAX_POSTS 512
 #define MAX_FOLLOWS 512
+#define MAX_LOGINS 128
 
 typedef struct {
     unsigned int idolID;
@@ -24,10 +25,17 @@ typedef struct {
     unsigned int idolID;
 } FollowEntry;
 
+typedef struct {
+    int inUse;
+    unsigned int userID;
+    struct sockaddr_in addr;
+} LoginEntry;
+
 static Post posts[MAX_POSTS];
 static int post_count = 0;
 static FollowEntry follows[MAX_FOLLOWS];
 static int follow_count = 0;
+static LoginEntry logins[MAX_LOGINS];
 
 static void DieWithError(const char *msg) {
     perror(msg);
@@ -82,6 +90,9 @@ static int request_tfa(int sock, const struct sockaddr_in *tfaAddr, unsigned int
 
 static void add_follow(unsigned int fan, unsigned int idol) {
     if (follow_count >= MAX_FOLLOWS) return;
+    for (int i = 0; i < follow_count; ++i) {
+        if (follows[i].fanID == fan && follows[i].idolID == idol) return; /* avoid duplicates */
+    }
     follows[follow_count].fanID = fan;
     follows[follow_count].idolID = idol;
     follow_count++;
@@ -112,28 +123,69 @@ static void add_post(unsigned int idol, const char *text) {
     post_count++;
 }
 
-static void build_feed(unsigned int fan, char *out, size_t outlen) {
-    out[0] = '\0';
-    for (int i = 0; i < post_count; ++i) {
-        if (is_follower(fan, posts[i].idolID)) {
-            char line[128];
-            snprintf(line, sizeof(line), "[%u] %s\n", posts[i].idolID, posts[i].text);
-            if (strlen(out) + strlen(line) + 1 < outlen) {
-                strcat(out, line);
-            } else {
-                break;
-            }
+static void add_login(unsigned int userID, const struct sockaddr_in *addr) {
+    for (int i = 0; i < MAX_LOGINS; ++i) {
+        if (logins[i].inUse && logins[i].userID == userID) {
+            logins[i].addr = *addr;
+            return;
+        }
+    }
+    for (int i = 0; i < MAX_LOGINS; ++i) {
+        if (!logins[i].inUse) {
+            logins[i].inUse = 1;
+            logins[i].userID = userID;
+            logins[i].addr = *addr;
+            return;
         }
     }
 }
 
-static void handle_client(int clntSock, int udpSock, const struct sockaddr_in *pkeAddr, const struct sockaddr_in *tfaAddr) {
+static void remove_login(unsigned int userID) {
+    for (int i = 0; i < MAX_LOGINS; ++i) {
+        if (logins[i].inUse && logins[i].userID == userID) {
+            logins[i].inUse = 0;
+            return;
+        }
+    }
+}
+
+/* Send each feed item as its own ackFeed message over the current TCP connection. */
+static void send_feed(int clntSock, unsigned int fan) {
+    int sent = 0;
+    for (int i = 0; i < post_count; ++i) {
+        if (is_follower(fan, posts[i].idolID)) {
+            LodiServerMessage resp;
+            memset(&resp, 0, sizeof(resp));
+            resp.messageType = ackFeed;
+            resp.userID = fan;
+            snprintf(resp.message, sizeof(resp.message), "[%u] %s", posts[i].idolID, posts[i].text);
+            send(clntSock, &resp, sizeof(resp), 0);
+            printf("[Lodi Server] Sent ackFeed to user %u for idol %u\n", fan, posts[i].idolID);
+            sent++;
+        }
+    }
+    if (!sent) {
+        LodiServerMessage resp;
+        memset(&resp, 0, sizeof(resp));
+        resp.messageType = ackFeed;
+        resp.userID = fan;
+        strncpy(resp.message, "No posts from your idols.", sizeof(resp.message) - 1);
+        send(clntSock, &resp, sizeof(resp), 0);
+        printf("[Lodi Server] Sent ackFeed (no posts) to user %u\n", fan);
+    }
+}
+
+static void handle_client(int clntSock, const struct sockaddr_in *clntAddr, int udpSock, const struct sockaddr_in *pkeAddr, const struct sockaddr_in *tfaAddr) {
     PClientToLodiServer req;
     ssize_t n = recv(clntSock, &req, sizeof(req), 0);
     if (n != sizeof(req)) {
         fprintf(stderr, "[Lodi Server] Invalid request size\n");
         return;
     }
+
+    char addrbuf[64];
+    fmt_addr(clntAddr, addrbuf, sizeof(addrbuf));
+    printf("[Lodi Server] Received messageType=%d from %s for user %u\n", req.messageType, addrbuf, req.userID);
 
     LodiServerMessage resp;
     memset(&resp, 0, sizeof(resp));
@@ -147,18 +199,25 @@ static void handle_client(int clntSock, int udpSock, const struct sockaddr_in *p
             }
             resp.messageType = ackLogin;
             resp.userID = authOK ? req.userID : 0;
+            if (authOK) {
+                add_login(req.userID, clntAddr);
+            }
+            printf("[Lodi Server] Sent ackLogin to %s for user %u (status=%s)\n",
+                   addrbuf, req.userID, authOK ? "success" : "failure");
             break;
         }
         case follow: {
             add_follow(req.userID, req.recipientID);
             resp.messageType = ackFollow;
             resp.userID = req.userID;
+            printf("[Lodi Server] Processed follow: fan %u -> idol %u\n", req.userID, req.recipientID);
             break;
         }
         case unfollow: {
             remove_follow(req.userID, req.recipientID);
             resp.messageType = ackUnfollow;
             resp.userID = req.userID;
+            printf("[Lodi Server] Processed unfollow: fan %u -> idol %u\n", req.userID, req.recipientID);
             break;
         }
         case post: {
@@ -166,17 +225,18 @@ static void handle_client(int clntSock, int udpSock, const struct sockaddr_in *p
             resp.messageType = ackPost;
             resp.userID = req.userID;
             strncpy(resp.message, "OK", sizeof(resp.message) - 1);
+            printf("[Lodi Server] Stored post from user %u: \"%s\"\n", req.userID, req.message);
             break;
         }
         case feed: {
-            resp.messageType = ackFeed;
-            resp.userID = req.userID;
-            build_feed(req.userID, resp.message, sizeof(resp.message));
-            break;
+            send_feed(clntSock, req.userID);
+            return; /* feed sends all data itself */
         }
         case logout: {
             resp.messageType = ackLogout;
             resp.userID = req.userID;
+            remove_login(req.userID);
+            printf("[Lodi Server] Logged out user %u\n", req.userID);
             break;
         }
         default:
@@ -192,6 +252,9 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Usage: %s <LODI_TCP_PORT> <PKE_IP> <PKE_PORT> <TFA_IP:TFA_PORT>\n", argv[0]);
         exit(1);
     }
+
+    /* Line-buffer stdout so logs appear immediately. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
 
     unsigned short tcpPort = (unsigned short)atoi(argv[1]);
     char *pkeIP = argv[2];
@@ -246,7 +309,7 @@ int main(int argc, char *argv[]) {
             perror("accept() failed");
             continue;
         }
-        handle_client(clntSock, udpSock, &pkeAddr, &tfaAddr);
+        handle_client(clntSock, &clntAddr, udpSock, &pkeAddr, &tfaAddr);
         close(clntSock);
     }
 

@@ -110,6 +110,7 @@ int main(int argc, char *argv[]) {
         TFAClientOrLodiServerToTFAServer msg;
         ssize_t n = recvfrom(sock, &msg, sizeof(msg), 0, (struct sockaddr *)&from, &fromLen);
         if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue; /* timeout/no data */
             perror("recvfrom() failed");
             continue;
         }
@@ -184,6 +185,9 @@ int main(int argc, char *argv[]) {
             } else {
                 printf("[TFA Server] Did not receive proper ackRegTFA; continuing\n");
             }
+            /* Restore blocking mode for main loop. */
+            struct timeval tv_reset = {0, 0};
+            setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv_reset, sizeof(tv_reset));
         } else if (msg.messageType == requestAuth) {
             TFAEntry *e = findEntry(msg.userID);
             if (!e) {
