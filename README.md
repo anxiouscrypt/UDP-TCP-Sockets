@@ -7,16 +7,6 @@ Components
 - `lodi_server` (TCP, per request): handles login (PKE+TFA), follow, unfollow, post, feed, logout; keeps in-memory followers/posts.
 - `lodi_client`: UDP to register key with PKE; TCP per request for login/follow/unfollow/post/feed/logout; derives userID/keys from username/password.
 
-Protocol
-- Project 1 UDP messages (PKE/TFA) unchanged.
-- Project 2 Lodi TCP messages (`include/protocol.h`):
-  - `PClientToLodiServer { login, post, feed, follow, unfollow, logout; userID; recipientID; timestamp; digitalSig; char message[100]; }`
-  - `LodiServerMessage { ackLogin, ackPost, ackFeed, ackFollow, ackUnfollow, ackLogout; userID; char message[100]; }`
-
-Crypto stub
-- `include/util.h` provides RSA-style sign/verify with fixed exponent 65537; `publicKey` is modulus `n`, `privateKey` is exponent `d`.
-- Keys are derived deterministically from a password (not secure); use the same username/password on TFA and Lodi clients to match userID/keys.
-
 Build
 ```sh
 gcc -Iinclude -o bin/pke_server src/pke_server.c
@@ -39,7 +29,7 @@ Notes:
 - Ports can be changed; pass matching values.
 - `responseAuth`/`ackLogin` use `userID` to indicate success (echoed) or failure (`0`).
 - Lodi client retries PKE register on UDP timeout; TCP requests are blocking per attempt. TFA client blocks waiting for pushes.
-- Feed requests: the server streams one `ackFeed` per post (message text includes idol ID) and closes the TCP connection when done; the client prints all items until EOF.
+- Feed requests: the server streams one `ackFeed` per post (message text includes idol ID) and closes the TCP connection when done;
 
 Quick test (single fan/idol on localhost)
 - Terminal 1: `bin/pke_server 5000`
@@ -51,7 +41,7 @@ Quick test (single fan/idol on localhost)
 
 Quick test (two users)
 - Repeat the TFA client + Lodi client steps with a different username/password in new terminals (e.g., ports unchanged).
-- In user B’s Lodi client, Follow user A’s ID, then Request feed after user A posts; you should see user A’s posts via ackFeed messages.
+- In user B’s Lodi client, Follow user A’s Username, then Request feed after user A posts; you should see user A’s posts via ackFeed messages.
 
 Behavior summary
 - `pke_server`: registerKey/requestKey (UDP), stores/returns public keys.
